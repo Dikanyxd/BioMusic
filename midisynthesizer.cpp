@@ -1,55 +1,141 @@
 #include "midisynthesizer.h"
+
 #include <cmath>
+#include <cstring>
+
 #include <QDebug>
+#include <QMutexLocker>
+
 #include <QMediaDevices>
 #include <QAudioDevice>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 double MidiSynthesizer::pitchToFrequency(int pitch)
 {
     return 440.0 * pow(2.0, (pitch - 69) / 12.0);
 }
 
-double WaveGenerator::adsrEnvelope(double t, double totalDur,
-                                   double attack, double decay,
-                                   double sustain, double release)
+double WaveGenerator::adsrEnvelope(
+    double t,
+    double totalDur,
+    double attack,
+    double decay,
+    double sustain,
+    double release)
 {
     if (t < attack)
+    {
         return t / attack;
-    else if (t < attack + decay) {
-        double progress = (t - attack) / decay;
-        return 1.0 - progress * (1.0 - sustain);
     }
-    else if (t > totalDur - release) {
-        double progress = (t - (totalDur - release)) / release;
+
+    if (t < attack + decay)
+    {
+        double progress =
+            (t - attack) / decay;
+
+        return 1.0 -
+               progress * (1.0 - sustain);
+    }
+
+    if (t > totalDur - release)
+    {
+        double progress =
+            (t - (totalDur - release))
+            / release;
+
         return sustain * (1.0 - progress);
     }
-    else
-        return sustain;
+
+    return sustain;
 }
 
-QVector<float> WaveGenerator::generateNote(int pitch, int durationMs, int sampleRate)
+QVector<float> WaveGenerator::generateNote(
+    int pitch,
+    int durationMs,
+    int sampleRate,
+    double startPhase,
+    double *endPhase)
 {
-    double frequency = MidiSynthesizer::pitchToFrequency(pitch);
-    int totalSamples = durationMs * sampleRate / 1000;
+    double frequency =
+        MidiSynthesizer::pitchToFrequency(pitch);
+
+    int totalSamples =
+        durationMs * sampleRate / 1000;
+
     QVector<float> samples(totalSamples);
-    double totalDurSec = durationMs / 1000.0;
 
-    double attack  = 0.015;
-    double decay   = 0.08;
-    double sustain = 0.65;
-    double release = 0.06;
+    double totalDurSec =
+        durationMs / 1000.0;
 
-    for (int i = 0; i < totalSamples; ++i) {
-        double t = (double)i / sampleRate;
-        double env = adsrEnvelope(t, totalDurSec, attack, decay, sustain, release);
+    double attack  = 0.012;
+    double decay   = 0.055;
+    double sustain = 0.46;
+    double release = 0.095;
 
-        double value = sin(2.0 * M_PI * frequency * t);
-        value += 0.30 * sin(2.0 * M_PI * 2.0 * frequency * t);
-        value += 0.12 * sin(2.0 * M_PI * 3.0 * frequency * t);
-        value += 0.06 * sin(2.0 * M_PI * 4.0 * frequency * t);
-        value /= 1.5;
+    double phase = startPhase;
 
-        samples[i] = static_cast<float>(env * value);
+    double phaseIncrement =
+        2.0 * M_PI * frequency / sampleRate;
+
+    for (int i = 0; i < totalSamples; ++i)
+    {
+        double t =
+            (double)i / sampleRate;
+
+        double env =
+            adsrEnvelope(
+                t,
+                totalDurSec,
+                attack,
+                decay,
+                sustain,
+                release
+                );
+
+        double s1 = sin(phase);
+        double s2 = 0.18 * sin(phase * 2.0);
+        double s3 = 0.08 * sin(phase * 3.0);
+
+        double sample =
+            (s1 + s2 + s3);
+
+        sample *= env;
+
+        sample *= 0.45;
+
+        samples[i] =
+            static_cast<float>(sample);
+
+        phase += phaseIncrement;
+
+        if (phase >= 2.0 * M_PI)
+        {
+            phase -= 2.0 * M_PI;
+        }
+    }
+    int fadeSamples =
+        sampleRate * 10 / 1000;
+
+    fadeSamples =
+        qMin(fadeSamples, totalSamples);
+
+    for (int i = totalSamples - fadeSamples;
+         i < totalSamples;
+         ++i)
+    {
+        float ratio =
+            float(i - (totalSamples - fadeSamples))
+            / fadeSamples;
+
+        samples[i] *= (1.0f - ratio);
+    }
+
+    if (endPhase)
+    {
+        *endPhase = phase;
     }
 
     return samples;
@@ -61,107 +147,192 @@ MidiSynthesizer::MidiSynthesizer(QObject *parent)
     m_audioDevice(nullptr),
     m_sampleRate(44100),
     m_initialized(false),
-    m_useInt16(false)
+    m_useInt16(false),
+    m_phase(0.0),
+    m_notePlaying(false)
 {
     qDebug() << "MidiSynthesizer created";
 }
 
 MidiSynthesizer::~MidiSynthesizer()
 {
-    if (m_audioSink) {
+    if (m_audioSink)
+    {
         m_audioSink->stop();
     }
 }
 
 bool MidiSynthesizer::ensureAudioReady()
 {
-    if (m_initialized) return true;
+    if (m_initialized)
+    {
+        return true;
+    }
 
-    qDebug() << "Initializing audio subsystem...";
+    QAudioDevice outputDevice =
+        QMediaDevices::defaultAudioOutput();
 
-    QAudioDevice outputDevice = QMediaDevices::defaultAudioOutput();
-    if (outputDevice.isNull()) {
-        qWarning() << "No audio output device available!";
+    if (outputDevice.isNull())
+    {
+        qWarning()
+        << "No audio device";
+
         return false;
     }
 
     QAudioFormat format;
+
     format.setSampleRate(m_sampleRate);
+
     format.setChannelCount(1);
-    format.setSampleFormat(QAudioFormat::Float);
 
-    if (!outputDevice.isFormatSupported(format)) {
-        qWarning() << "Float audio format not supported, falling back to Int16";
-        format.setSampleFormat(QAudioFormat::Int16);
-        m_useInt16 = true;
+    format.setSampleFormat(
+        QAudioFormat::Int16
+        );
 
-        if (!outputDevice.isFormatSupported(format)) {
-            qWarning() << "Int16 also not supported! Trying preferred format.";
-            format = outputDevice.preferredFormat();
-            m_useInt16 = (format.sampleFormat() != QAudioFormat::Float);
-        }
+    m_useInt16 = true;
+
+    if (!outputDevice.isFormatSupported(format))
+    {
+        format =
+            outputDevice.preferredFormat();
     }
 
-    qDebug() << "Audio format: rate=" << format.sampleRate()
-             << "ch=" << format.channelCount()
-             << "fmt=" << format.sampleFormat()
-             << "(useInt16=" << m_useInt16 << ")";
+    m_audioSink =
+        new QAudioSink(
+            outputDevice,
+            format,
+            this
+            );
 
-    m_audioSink = new QAudioSink(outputDevice, format, this);
-    m_audioSink->setVolume(1.0);
-    m_audioDevice = m_audioSink->start();
+    m_audioSink->setBufferSize(65536);
 
-    if (!m_audioDevice) {
-        qWarning() << "Failed to start audio sink (m_audioDevice is null)";
-        return false;
-    }
+    m_audioSink->setVolume(0.8);
 
-    if (m_audioSink->error() != QAudio::NoError) {
-        qWarning() << "Audio sink error after start:" << m_audioSink->error();
+    m_audioDevice =
+        m_audioSink->start();
+
+    if (!m_audioDevice)
+    {
+        qWarning()
+        << "Audio start failed";
+
         return false;
     }
 
     m_initialized = true;
-    qDebug() << "Audio initialized successfully (push mode)";
+
+    qDebug()
+        << "Audio initialized";
+
     return true;
 }
 
-void MidiSynthesizer::playNote(int pitch, int velocity)
+float MidiSynthesizer::softClip(float x)
 {
-    if (!ensureAudioReady()) {
-        qWarning() << "Cannot play note: audio not ready";
+    return tanh(x * 1.2f);
+}
+
+void MidiSynthesizer::playNote(
+    int pitch,
+    int velocity)
+{
+    QMutexLocker locker(&m_audioMutex);
+
+    if (m_notePlaying)
+    {
         return;
     }
 
+    if (!ensureAudioReady())
+    {
+        return;
+    }
+
+    m_notePlaying = true;
+
     emit notePlaying(pitch);
 
-    int durationMs = qMax(200, 600 - (pitch - 60) * 5);
-    QVector<float> samples = WaveGenerator::generateNote(pitch, durationMs, m_sampleRate);
+    int durationMs =
+        qMax(
+            250,
+            700 - (pitch - 60) * 4
+            );
 
-    float velocityScale = 0.4f + (velocity / 127.0f) * 0.6f;
-    for (float &s : samples) {
+    double endPhase = 0.0;
+
+    QVector<float> samples =
+        WaveGenerator::generateNote(
+            pitch,
+            durationMs,
+            m_sampleRate,
+            m_phase,
+            &endPhase
+            );
+
+    m_phase = endPhase;
+
+    float velocityScale =
+        0.2f +
+        (velocity / 127.0f) * 0.5f;
+
+    for (float &s : samples)
+    {
         s *= velocityScale;
+
+        s = softClip(s);
     }
 
     playSamples(samples);
+
+    QTimer::singleShot(
+        durationMs,
+        this,
+        [this]()
+        {
+            m_notePlaying = false;
+        });
 }
 
-void MidiSynthesizer::playSamples(const QVector<float> &samples)
+void MidiSynthesizer::playSamples(
+    const QVector<float> &samples)
 {
-    if (!m_audioDevice) return;
-
-    if (m_useInt16) {
-        QVector<qint16> converted(samples.size());
-        for (int i = 0; i < samples.size(); ++i) {
-            float clamped = qBound(-1.0f, samples[i], 1.0f);
-            converted[i] = static_cast<qint16>(clamped * 32767.0f);
-        }
-        m_audioDevice->write(
-            reinterpret_cast<const char*>(converted.constData()),
-            static_cast<qint64>(converted.size()) * sizeof(qint16));
-    } else {
-        m_audioDevice->write(
-            reinterpret_cast<const char*>(samples.constData()),
-            static_cast<qint64>(samples.size()) * sizeof(float));
+    if (!m_audioDevice)
+    {
+        return;
     }
+
+    QByteArray pcm;
+
+    pcm.resize(
+        samples.size()
+        * sizeof(qint16)
+        );
+
+    qint16 *out =
+        reinterpret_cast<qint16*>(
+            pcm.data()
+            );
+
+    for (int i = 0;
+         i < samples.size();
+         ++i)
+    {
+        float s =
+            qBound(
+                -1.0f,
+                samples[i],
+                1.0f
+                );
+
+        out[i] =
+            static_cast<qint16>(
+                s * 32767.0f
+                );
+    }
+
+    m_audioDevice->write(
+        pcm.constData(),
+        pcm.size()
+        );
 }
